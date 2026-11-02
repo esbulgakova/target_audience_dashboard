@@ -40,16 +40,20 @@ def upsert(session, model, rows, keys):
 
 
 class SearchService:
-    def __init__(self, settings, session_factory, collector, cache, now=None):
+    def __init__(self, settings, session_factory, collector, cache, now=None, credential_partition=None):
         self.settings = settings
         self.sessions = session_factory
         self.collector = collector
         self.cache = cache
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.local_lock = threading.Lock()
+        self.credential_partition = credential_partition
 
     def query_key(self, query, modes):
         payload = [normalize_query(query), sorted(set(modes)), self.settings.data_mode, self.settings.policy_key()]
+        if self.credential_partition is not None:
+            # Разные VK-аккаунты могут иметь разные права на стены/сообщества.
+            payload.append(self.credential_partition())
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
     def _find(self, session, key):
@@ -105,6 +109,8 @@ class SearchService:
                 # Неполный ответ можно показать, но повторный поиск обязан попытаться дополнить его.
                 row.expires_at = completed + timedelta(seconds=self.settings.cache_ttl_seconds if result.complete else 0)
                 row.details = {"warnings": result.warnings, "limited": result.limited, "complete": result.complete}
+                if self.credential_partition is not None:
+                    row.details["credential_partition"] = self.credential_partition()
                 session.flush()
                 dashboard = self.dashboard(session, row, False)
                 search_id = row.id
@@ -170,16 +176,22 @@ class SearchService:
     def suggestions(self, query):
         prefix = normalize_query(query)
         cache_key = suggestion_key(self.settings.data_mode, prefix)
+        partition = self.credential_partition() if self.credential_partition is not None else None
+        if partition is not None:
+            cache_key += ":" + hashlib.sha256(partition.encode()).hexdigest()
         # Источник подсказок — БД. TTL короткий: новая тема появится не позже чем через 30 сек.
         cached = self.cache.get(cache_key)
         if isinstance(cached, list) and cached:
             return cached
         with self.sessions() as session:
-            rows = session.execute(select(Search.normalized_query, Search.query).where(
+            statement = select(Search.normalized_query, Search.query).where(
                 Search.mode == self.settings.data_mode,
                 Search.normalized_query.startswith(prefix, autoescape=True),
                 Search.collected_at.is_not(None),
-            ).order_by(Search.collected_at.desc()).limit(100))
+            )
+            if partition is not None:
+                statement = statement.where(Search.details["credential_partition"].as_string() == partition)
+            rows = session.execute(statement.order_by(Search.collected_at.desc()).limit(100))
             seen, suggestions = set(), []
             for normalized, original in rows:
                 if normalized not in seen:

@@ -1,4 +1,4 @@
-"""Small synchronous VK client: form POSTs keep credentials out of URLs."""
+"""Synchronous VK client: bounded retries and credentials outside URLs."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import time
 from typing import Any
 
 import httpx
+
+from .auth import AuthError
 
 
 class VkApiError(RuntimeError):
@@ -20,7 +22,7 @@ class VkApiError(RuntimeError):
 
 
 ERROR_MESSAGES = {
-    5: "токен VK недействителен или истёк. Проверьте VK_TOKEN в .env.",
+    5: "токен VK недействителен или истёк. Повторите вход через VK ID; для ручного ключа проверьте VK_TOKEN.",
     6: "VK ограничил частоту запросов. Попробуйте позже.",
     7: "приложению или токену не разрешён этот метод.",
     9: "VK ограничил число однотипных действий. Попробуйте позже.",
@@ -45,9 +47,10 @@ class VkClient:
     _rate_lock = threading.Lock()
     _next_request_at = 0.0
 
-    def __init__(self, settings: Any, client: httpx.Client | None = None):
+    def __init__(self, settings: Any, client: httpx.Client | None = None, token_provider=None):
         token = settings.vk_token
         self.token = token.get_secret_value() if hasattr(token, "get_secret_value") else str(token or "")
+        self.token_provider = token_provider
         self.version = settings.vk_api_version
         self.base_url = settings.vk_api_base_url.rstrip("/")
         self.interval = settings.vk_request_interval
@@ -111,24 +114,34 @@ class VkClient:
             raise VkApiError(method, message)
 
     def call(self, method: str, *, deadline: float, **params: Any) -> Any:
-        if not self.token:
-            raise VkApiError(method, "VK_TOKEN не задан. Добавьте токен в .env или установите DATA_MODE=demo.")
-        for attempt in range(3):
+        self._remaining(deadline, method)
+        try:
+            token = self.token_provider.access_token(deadline=deadline) if self.token_provider else self.token
+        except AuthError as error:
+            raise VkApiError(method, str(error)) from None
+        if not token:
+            raise VkApiError(method, "Войдите через VK ID или используйте демонстрационный режим.")
+        refreshed = False
+        attempt = 0
+        while attempt < 3:
             self._wait_turn(deadline, method)
             try:
                 response = self.client.post(
                     f"{self.base_url}/{method}",
-                    data={**params, "access_token": self.token, "v": self.version, "lang": "ru"},
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={**params, "v": self.version, "lang": "ru"},
                     timeout=min(self.timeout, self._remaining(deadline, method)),
                 )
             except httpx.RequestError:
                 if attempt < 2:
                     self._backoff(attempt, deadline, method)
+                    attempt += 1
                     continue
                 raise VkApiError(method, "не удалось связаться с VK. Проверьте сеть и повторите поиск.") from None
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < 2:
                     self._backoff(attempt, deadline, method)
+                    attempt += 1
                     continue
                 raise VkApiError(method, "VK временно недоступен или ограничил запросы. Попробуйте позже.")
             if response.status_code != 200:
@@ -143,8 +156,16 @@ class VkClient:
                 error = payload["error"]
                 code = error.get("error_code") if isinstance(error, dict) else None
                 code = code if isinstance(code, int) and not isinstance(code, bool) else None
+                if code == 5 and self.token_provider is not None and not refreshed:
+                    refreshed = True
+                    try:
+                        token = self.token_provider.refresh_after_rejection(token, deadline=deadline)
+                    except AuthError as auth_error:
+                        raise VkApiError(method, str(auth_error), 5) from None
+                    continue
                 if code in (6, 10) and attempt < 2:
                     self._backoff(attempt, deadline, method)
+                    attempt += 1
                     continue
                 # Never expose error_msg, request_params, request URLs or tokens.
                 raise VkApiError(method, ERROR_MESSAGES.get(code, "VK отклонил запрос."), code)

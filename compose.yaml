@@ -33,6 +33,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_MODE: ${DATA_MODE:-demo}
       VK_TOKEN: ${VK_TOKEN:-}
+      VK_APP_ID: ${VK_APP_ID:-}
+      VK_SERVICE_TOKEN: ${VK_SERVICE_TOKEN:-}
+      VK_REDIRECT_URI: http://localhost
+      FRONTEND_PUBLIC_URL: http://localhost:8501
+      VK_AUTH_FILE: /app/state/vk-auth.json
       VK_API_VERSION: ${VK_API_VERSION:-5.199}
       MAX_GROUPS: ${MAX_GROUPS:-3}
       MAX_MEMBERS_PER_GROUP: ${MAX_MEMBERS_PER_GROUP:-500}
@@ -41,8 +46,12 @@ services:
       MAX_USERS: ${MAX_USERS:-3000}
       MAX_CITY_LOOKUPS: ${MAX_CITY_LOOKUPS:-20}
       POST_SEARCH_DAYS: ${POST_SEARCH_DAYS:-30}
+    volumes:
+      - vk_auth_data:/app/state
     ports:
       - "127.0.0.1:8000:8000"
+      # VK ID возвращает браузер на http://localhost (порт 80).
+      - "127.0.0.1:80:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -115,3 +124,4 @@ services:
 
 volumes:
   postgres_data:
+  vk_auth_data:

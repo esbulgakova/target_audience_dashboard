@@ -14,6 +14,8 @@ from frontend.geo import regional_map
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 SOURCE_LABELS = {"groups": "Участники сообществ", "likes": "Лайки", "reposts": "Репосты"}
+DATA_LABELS = {"demo": "Демонстрация", "vk": "Данные VK"}
+AUTH_HEADERS = {"X-Requested-With": "AudienceDashboard"}
 COLORS = ["#087F8C", "#F1A66A", "#8A9BAC", "#6CBFB4", "#D2BBEF", "#ACCACD", "#E0E7EC"]
 
 
@@ -49,8 +51,107 @@ def health():
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def suggestions():
-    return api_request("GET", "/api/suggestions", params={"q": ""}, timeout=(3, 5)).get("suggestions", [])
+def suggestions(data_mode):
+    return api_request("GET", "/api/suggestions", params={"q": "", "data_mode": data_mode},
+                       timeout=(3, 5)).get("suggestions", [])
+
+
+def clear_search():
+    st.session_state.pop("dashboard", None)
+    st.session_state["search_topic"] = None
+    suggestions.clear()
+
+
+def save_service_token():
+    # A widget callback runs before the next render, so its value can be cleared safely.
+    secret = st.session_state.get("vk_service_token_input", "").strip()
+    try:
+        if not secret:
+            st.session_state["vk_notice"] = ("warning", "Вставьте сервисный ключ приложения.")
+            return
+        api_request("POST", "/api/vk/configure", json={"service_token": secret},
+                    headers=AUTH_HEADERS, timeout=(3, 20))
+        clear_search()
+        st.session_state["vk_notice"] = ("success", "Ключ сохранён на сервере. Теперь можно войти через VK ID.")
+    except ApiError as error:
+        st.session_state["vk_notice"] = ("error", str(error))
+    finally:
+        st.session_state["vk_service_token_input"] = ""
+
+
+def disconnect_vk():
+    try:
+        response = api_request("POST", "/api/vk/disconnect", json={}, headers=AUTH_HEADERS, timeout=(3, 25))
+        clear_search()
+        st.session_state["vk_notice"] = ("info", response.get("detail") or "Подключение VK отключено.")
+    except ApiError as error:
+        st.session_state["vk_notice"] = ("error", str(error))
+
+
+def check_vk_access():
+    try:
+        response = api_request("POST", "/api/vk/check", json={}, headers=AUTH_HEADERS, timeout=(3, 55))
+        level = "success" if response.get("ok") else "warning"
+        st.session_state["vk_notice"] = (level, response.get("detail") or "Проверка завершена.")
+    except ApiError as error:
+        st.session_state["vk_notice"] = ("error", str(error))
+
+
+def render_vk_connection(status, status_error=None):
+    with st.sidebar:
+        st.subheader("Подключение VK")
+        if status_error:
+            st.warning(status_error)
+        if status.get("app_id"):
+            st.caption(f"Приложение VK ID: {status['app_id']}")
+        if status.get("connected"):
+            st.success("VK подключён")
+            if status.get("user_id"):
+                st.caption(f"Аккаунт VK: {status['user_id']}")
+            if status.get("source") == "oauth":
+                st.caption("Токен обновляется автоматически при обращении к VK.")
+            else:
+                st.caption("Используется ключ из настроек сервера. Его срок действия нужно проверять вручную.")
+            st.button("Проверить доступ к поиску", key="vk_check", on_click=check_vk_access)
+            if status.get("source") == "oauth":
+                st.button("Отключить VK", key="vk_disconnect", on_click=disconnect_vk)
+        elif status.get("reauthorization_required"):
+            st.warning("Нужно снова войти через VK ID, чтобы продолжить сбор.")
+        elif status.get("configured"):
+            st.info("Войдите через VK ID, чтобы подключить реальные данные.")
+        elif status.get("enabled"):
+            st.info("Откройте настройку ниже и добавьте сервисный ключ приложения.")
+        elif not status_error:
+            st.caption("Для подключения укажите VK_APP_ID в настройках сервера.")
+
+        if status.get("enabled") and status.get("configured") and status.get("login_url"):
+            label = "Войти заново через VK ID" if status.get("connected") else "Войти через VK ID"
+            st.link_button(label, status["login_url"], type="primary", width="stretch")
+            st.caption("После входа откроется дэшборд. Если остались на этой вкладке, обновите подключение.")
+        st.button("Обновить подключение", key="vk_refresh")
+        notice = st.session_state.pop("vk_notice", None)
+        if notice:
+            getattr(st, notice[0])(notice[1])
+
+        if status.get("enabled"):
+            with st.expander("Настройка приложения VK ID"):
+                st.write("В кабинете VK ID выберите уровень конфиденциальности **«Конфиденциальное»**.")
+                st.write(
+                    "В поле **«IP-адрес сервера»** укажите внешний IP, с которого этот компьютер "
+                    "выходит в интернет. При включённом VPN это может быть IP VPN. "
+                    "Адрес localhost в это поле не подходит."
+                )
+                st.caption("Базовый домен: localhost. Доверенный redirect URL: http://localhost.")
+                with st.form("vk_setup"):
+                    st.text_input(
+                        "Сервисный ключ доступа", type="password", key="vk_service_token_input",
+                        help="Скопируйте сервисный ключ из настроек приложения VK ID. Защищённый ключ сюда не подходит.",
+                    )
+                    st.form_submit_button("Сохранить ключ", on_click=save_service_token)
+                st.caption(
+                    "Ключ передаётся серверу и очищается из поля. Полученные при входе токены "
+                    "хранятся только на сервере; вручную менять их каждый час не нужно."
+                )
 
 
 def number(value):
@@ -245,17 +346,43 @@ def main():
     except ApiError as error:
         st.warning(str(error))
         service = {}
-    if service.get("mode") == "demo":
-        st.caption("🧪 Демо-режим · токен VK не требуется")
-    elif service.get("mode") == "vk":
-        st.caption("Подключён сбор через API ВКонтакте")
+    login_return = st.query_params.pop("vk_login", None)
+    if login_return:
+        clear_search()
+    status_error = None
     try:
-        previous_queries = suggestions()
+        vk_status = api_request("GET", "/api/vk/status", timeout=(3, 5))
+    except ApiError as error:
+        vk_status = {}
+        status_error = str(error)
+    connection_identity = (vk_status.get("source"), vk_status.get("user_id"), bool(vk_status.get("connected")))
+    if status_error is None and st.session_state.get("vk_connection_identity") != connection_identity:
+        clear_search()
+        st.session_state["vk_connection_identity"] = connection_identity
+    # The URL flag only asks us to refresh. It is never proof of a successful login.
+    if login_return and vk_status.get("connected"):
+        st.session_state["data_mode"] = "vk"
+    render_vk_connection(vk_status, status_error)
+    if "data_mode" not in st.session_state:
+        st.session_state["data_mode"] = service.get("mode", "demo")
+    data_mode = st.radio("Источник данных", list(DATA_LABELS), format_func=DATA_LABELS.get,
+                         horizontal=True, key="data_mode", on_change=clear_search)
+    search_available = data_mode == "demo" or bool(vk_status.get("connected"))
+    if data_mode == "demo":
+        st.caption("🧪 Все данные вымышлены · подключение VK не требуется")
+    elif status_error:
+        st.warning("Подключение VK пока не удалось проверить. Обновите подключение слева перед новым поиском.")
+    elif not search_available:
+        st.warning("Сначала подключите VK через панель слева. Демонстрация доступна без входа.")
+    else:
+        st.caption("Сбор доступных данных через API ВКонтакте")
+    try:
+        previous_queries = suggestions(data_mode) if search_available else []
     except ApiError:
         previous_queries = []
 
     with st.form("search_form"):
-        query = st.selectbox("Тема поиска", previous_queries, index=None, accept_new_options=True,
+        query = st.selectbox("Тема поиска", previous_queries, index=None, accept_new_options=True, key="search_topic",
                              placeholder="Например: фотография, настольные игры, велоспорт",
                              help="Начните печатать: сохранённые темы появятся в подсказках. Для новой темы нажмите Enter.")
         st.caption("Где искать аудиторию")
@@ -267,10 +394,12 @@ def main():
         with cols[1]:
             selected["likes"] = st.checkbox("Лайки публикаций", help="Пользователи, поставившие лайк найденным по теме публикациям.")
         with cols[2]:
-            selected["reposts"] = st.checkbox("Репосты публикаций", help="Доступные авторы репостов найденных публикаций.")
-        submitted = st.form_submit_button("Найти аудиторию", type="primary", width="stretch")
+            selected["reposts"] = st.checkbox("Репосты публикаций", help="Списки репостов доступны только редактору/администратору сообщества или владельцу личной стены.")
+        if data_mode == "vk":
+            st.caption("Репосты доступны только для стен, которыми вы управляете как редактор, администратор или владелец.")
+        submitted = st.form_submit_button("Найти аудиторию", type="primary", width="stretch", disabled=not search_available)
 
-    if submitted:
+    if submitted and search_available:
         modes = [key for key, value in selected.items() if value]
         if not query or not query.strip():
             st.error("Введите тему поиска.")
@@ -279,7 +408,10 @@ def main():
         else:
             with st.spinner("Собираем доступные данные и готовим статистику. Это может занять несколько минут…"):
                 try:
-                    result = api_request("POST", "/api/search", json={"query": query, "modes": modes}, timeout=(5, 330))
+                    result = api_request("POST", "/api/search",
+                                         json={"query": query, "modes": modes, "data_mode": data_mode}, timeout=(5, 330))
+                    if result.get("mode") != data_mode:
+                        raise ApiError("Сервис вернул данные другого режима. Повторите поиск.")
                     st.session_state["dashboard"] = result
                     suggestions.clear()
                 except ApiError as error:
@@ -287,7 +419,7 @@ def main():
                     if "dashboard" in st.session_state:
                         st.info("Ниже остался результат предыдущего успешного поиска; тема и время сбора указаны в его заголовке.")
 
-    if "dashboard" in st.session_state:
+    if st.session_state.get("dashboard", {}).get("mode") == data_mode:
         render_dashboard(st.session_state["dashboard"])
     else:
         st.info("Введите тему и нажмите «Найти аудиторию». Здесь появятся размер выборки, пол, возраст и география.")

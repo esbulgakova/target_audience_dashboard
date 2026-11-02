@@ -37,7 +37,8 @@ class StubVk:
 def test_vk_errors_do_not_include_token_or_remote_error_text():
     def respond(request):
         assert "test-secret" not in str(request.url)
-        assert parse_qs(request.content.decode())["access_token"] == ["test-secret-never-log"]
+        assert request.headers["Authorization"] == "Bearer test-secret-never-log"
+        assert "access_token" not in parse_qs(request.content.decode())
         assert parse_qs(request.content.decode())["lang"] == ["ru"]
         return httpx.Response(200, json={"error": {
             "error_code": 5, "error_msg": "leak test-secret-never-log",
@@ -228,3 +229,51 @@ def test_demo_profiles_are_stable_across_queries_and_sources():
         assert first.users[uid] == second.users[uid]
     assert len(first.users) < sum(first.source_stats.values())
     assert first == collector.collect("музыка", ["groups", "likes", "reposts"])
+
+
+def test_expired_oauth_token_is_refreshed_once_without_leaking_credentials():
+    class Provider:
+        refreshes = 0
+
+        def access_token(self, deadline=None):
+            return "old-access"
+
+        def refresh_after_rejection(self, token, deadline=None):
+            assert token == "old-access"
+            self.refreshes += 1
+            return "new-access"
+
+    provider = Provider()
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        assert "access" not in str(request.url)
+        if request.headers["authorization"] == "Bearer old-access":
+            return httpx.Response(200, json={"error": {"error_code": 5}})
+        assert request.headers["authorization"] == "Bearer new-access"
+        return httpx.Response(200, json={"response": {"items": [], "count": 0}})
+
+    client = VkClient(settings(), httpx.Client(transport=httpx.MockTransport(respond)), token_provider=provider)
+    assert client.call("groups.search", deadline=time.monotonic() + 5)["items"] == []
+    assert provider.refreshes == 1 and len(calls) == 2
+
+
+def test_repeated_auth_rejection_does_not_loop_refresh():
+    class Provider:
+        refreshes = 0
+
+        def access_token(self, deadline=None):
+            return "old"
+
+        def refresh_after_rejection(self, token, deadline=None):
+            self.refreshes += 1
+            return "new"
+
+    provider = Provider()
+    client = VkClient(settings(), httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"error": {"error_code": 5}})
+    )), token_provider=provider)
+    with pytest.raises(VkApiError) as error:
+        client.call("groups.search", deadline=time.monotonic() + 5)
+    assert error.value.code == 5 and provider.refreshes == 1

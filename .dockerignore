@@ -8,3 +8,6 @@
 .ruff_cache
 *.sqlite*
 *.log
+
+# Локальные ключи и токены VK ID.
+state/

@@ -2,6 +2,8 @@ import hashlib
 import json
 from typing import Literal
 
+from urllib.parse import urlsplit
+
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -13,6 +15,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     data_mode: Literal["demo", "vk"] = "demo"
     vk_token: SecretStr = SecretStr("")
+    vk_app_id: str = Field("", pattern=r"^([0-9]+)?$")
+    vk_service_token: SecretStr = SecretStr("")
+    vk_redirect_uri: str = "http://localhost"
+    frontend_public_url: str = "http://localhost:8501"
+    vk_auth_file: str = "/app/state/vk-auth.json"
     vk_api_version: str = "5.199"
     vk_api_base_url: str = "https://api.vk.com/method"
     vk_request_interval: float = Field(0.36, ge=0.34)
@@ -28,9 +35,17 @@ class Settings(BaseSettings):
     post_search_days: int = Field(30, ge=1, le=365)
 
     @model_validator(mode="after")
-    def validate_token(self):
-        if self.data_mode == "vk" and not self.vk_token.get_secret_value().strip():
-            raise ValueError("Для DATA_MODE=vk заполните VK_TOKEN в локальном .env")
+    def validate_local_addresses(self):
+        # Этот проект запускается локально; redirect не берётся из запроса браузера.
+        if self.vk_redirect_uri not in {"http://localhost", "https://localhost"}:
+            raise ValueError("VK_REDIRECT_URI должен быть http://localhost или https://localhost")
+        url = urlsplit(self.frontend_public_url)
+        if (
+            url.scheme not in {"http", "https"} or url.hostname not in {"localhost", "127.0.0.1"}
+            or url.username or url.password or url.query or url.fragment or url.path not in {"", "/"}
+        ):
+            raise ValueError("FRONTEND_PUBLIC_URL должен указывать на локальное приложение")
+        self.frontend_public_url = self.frontend_public_url.rstrip("/")
         return self
 
     def policy_key(self) -> str:
