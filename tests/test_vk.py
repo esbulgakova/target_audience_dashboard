@@ -53,6 +53,33 @@ def test_vk_errors_do_not_include_token_or_remote_error_text():
     assert "test-secret" not in str(caught.value)
 
 
+def test_profile_type_denial_is_safe_and_does_not_retry_or_refresh():
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={"error": {
+            "error_code": 1051,
+            "error_msg": "Method is not available for this profile type: test-secret-never-log",
+            "request_params": [{"key": "access_token", "value": "test-secret-never-log"}],
+        }})
+
+    provider = SimpleNamespace(
+        access_token=lambda **kwargs: "test-secret-never-log",
+        refresh_after_rejection=lambda *args, **kwargs: pytest.fail("Access denial must not refresh the token"),
+    )
+    client = VkClient(settings(), httpx.Client(transport=httpx.MockTransport(respond)), token_provider=provider)
+    with pytest.raises(VkApiError) as caught:
+        client.call("groups.search", deadline=time.monotonic() + 5, q="music")
+    message = str(caught.value)
+    assert caught.value.code == 1051 and caught.value.method == "groups.search"
+    assert "метод недоступен для типа доступа, выданного этому приложению" in message
+    assert "Разрешения на этот метод нужно уточнить у VK" in message
+    assert "1051" in message and len(calls) == 1
+    assert "test-secret" not in message and "request_params" not in message
+    assert "Method is not available" not in message
+
+
 def test_rate_limit_retries_are_bounded(monkeypatch):
     calls = []
 

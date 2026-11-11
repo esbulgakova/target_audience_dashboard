@@ -105,7 +105,8 @@ def render_vk_connection(status, status_error=None):
         if status.get("app_id"):
             st.caption(f"Приложение VK ID: {status['app_id']}")
         if status.get("connected"):
-            st.success("VK подключён")
+            st.success("Вход в VK выполнен" if status.get("source") == "oauth" else "Ключ VK добавлен")
+            st.caption("Доступ к поиску сообществ проверяется отдельно кнопкой ниже.")
             if status.get("user_id"):
                 st.caption(f"Аккаунт VK: {status['user_id']}")
             if status.get("source") == "oauth":
